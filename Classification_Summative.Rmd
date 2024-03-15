@@ -1,0 +1,302 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Introduction
+
+The data I chose is:
+Hotels
+- Aim is to predict if a booking will cancel or not
+- Target variable: is_canceled
+- Download: https://www.louisaslett.com/Courses/MISCADA/hotels.csv
+
+```{r}
+download.file("https://www.louisaslett.com/Courses/MISCADA/hotels.csv", "hotels.csv")
+hotels.original <- readr::read_csv("hotels.csv")
+```
+
+```{r}
+library("skimr")
+library("tidyverse")
+library("ggplot2")
+```
+
+*****
+
+# Data exploration
+
+```{r}
+View(hotels.original)
+```
+
+```{r}
+summary(hotels.original)
+```
+
+```{r}
+skim(hotels.original)
+```
+
+```{r}
+DataExplorer::plot_bar(hotels.original)
+```
+
+```{r}
+DataExplorer::plot_histogram(hotels.original)
+```
+
+```{r}
+DataExplorer::plot_boxplot(hotels.original, by = "is_canceled", ncol = 3)
+```
+
+```{r}
+ggplot(hotels.original,
+       aes(x = adr, y = stays_in_weekend_nights+stays_in_week_nights)) +
+  geom_point()
+```
+
+*****
+
+# Processing data
+
+## Removing anomalies
+```{r}
+hotels <- hotels.original |>
+  filter(adr < 4000)
+```
+
+## Delete some extraneous variables
+
+```{r}
+hotels <- hotels |>
+  select(-reservation_status, -reservation_status_date, -assigned_room_type, -country, -agent, -company)
+```
+
+## Make some changes to the data
+
+```{r}
+hotels <- hotels |>
+  mutate(kids = case_when(
+    children + babies > 0 ~ "kids",
+    TRUE ~ "none"
+  )) |>
+  select(-babies, -children) |>
+  mutate(parking = case_when(
+    required_car_parking_spaces > 0 ~ "parking",
+    TRUE ~ "none"
+  )) |>
+  select(-required_car_parking_spaces) |>
+  mutate(is_canceled = ifelse(is_canceled == 0, "no", "yes")) |>
+  mutate(total_nights = stays_in_weekend_nights+stays_in_week_nights) |>
+  select(-stays_in_weekend_nights, -stays_in_week_nights)
+  
+```
+
+```{r}
+hotels <- hotels %>% mutate_if(is.character, as.factor)
+```
+
+
+```{r}
+skim(hotels)
+```
+
+*****
+
+# Fitting the assessment model
+
+```{r}
+library("mlr3")
+library("mlr3learners")
+library("mlr3verse")
+library("data.table")
+library("ranger")
+```
+
+## Define tasks
+
+```{r}
+# Define tasks
+set.seed(212) # set seed for reproducibility
+
+iscanceled_task <- TaskClassif$new(id = "predict_cancled",
+                               backend = hotels,
+                               target = "is_canceled",
+                               positive = "yes")
+```
+
+## define 5-fold cross validation
+
+```{r}
+cv5 <- rsmp("cv", folds = 5)
+
+cv5$instantiate(iscanceled_task)
+```
+
+## define leaner
+
+```{r}
+lrn_baseline <- lrn("classif.featureless", predict_type = "prob") 
+
+lrn_log_reg  <- lrn("classif.log_reg", predict_type = "prob") 
+
+lrn_lda <- lrn("classif.lda", predict_type = "prob") 
+  
+lrn_cart     <- lrn("classif.rpart", predict_type = "prob") 
+
+lrn_ranger   <- lrn("classif.ranger", predict_type = "prob", id = "default") 
+
+lrn_xgboost  <- lrn("classif.xgboost", predict_type = "prob") 
+
+lrn_nnet <- lrn("classif.nnet", predict_type = "prob") 
+
+```
+
+```{r}
+library(apcluster)
+View(as.data.table(mlr_learners))
+```
+
+
+## Data processing for models that cannot handle missing values
+
+```{r}
+pl_missing <- po("fixfactors") %>>%
+  po("removeconstants") %>>%
+  po("imputesample", affect_columns = selector_type(c("ordered", "factor"))) %>>%
+  po("imputemean")
+
+pl_ranger <- pl_missing %>>% po(lrn_ranger)
+pl_lda <- pl_missing %>>% po(lrn_lda)
+pl_nnet <- pl_missing %>>% po(lrn_nnet)
+pl_log_reg <- pl_missing %>>% po(lrn_log_reg)
+```
+
+## Data processing for models that do not accept factor variables
+
+```{r}
+pl_xgb <- po("encode") %>>% po(lrn_xgboost)
+```
+
+```{r}
+library(mlr3)
+
+mlr_measures$keys("classif")
+```
+
+
+# Initial judgement of model performance
+
+```{r}
+library(mlr3misc)
+
+set.seed(212)
+
+res_1 <- benchmark(data.table(
+  task       = list(iscanceled_task),
+  learner    = list(lrn_baseline,
+                    lrn_cart,
+                    pl_log_reg,
+                    pl_lda,
+                    pl_nnet,
+                    pl_xgb,
+                    pl_ranger
+                    ),
+  resampling = list(cv5)
+  ), 
+  store_models = TRUE
+)
+
+
+result_1 <- res_1$aggregate(list(
+                   msr("classif.acc"), # Accuracy
+                   msr("classif.auc"), # Area Under the ROC Curve
+                   msr("classif.ce"),  # Classification Error
+                   msr("classif.fpr"), # False Positive Rate
+                   msr("classif.fnr"), # False Negative Rate
+                   msr("classif.precision"), # Precision
+                   msr("classif.mcc"), # Matthews Correlation Coefficient
+                   msr("classif.recall"))) # Recall
+
+
+view(result_1)
+```
+
+# Tuning for the random forest model
+
+```{r}
+lrn_ranger$param_set
+```
+
+```{r}
+library(mlr3tuning)
+
+learner = lrn("classif.ranger",  
+  num.trees = to_tune(800, 1200),  
+  mtry = to_tune(2, floor(sqrt(iscanceled_task$ncol))),  
+  min.node.size = to_tune(1, 10),
+  predict_type = "response"
+) 
+   
+set.seed(212)
+
+instance = tune(  
+  tuner = tnr("random_search"),
+  task = iscanceled_task,  
+  learner = learner,  
+  resampling = rsmp("holdout"),  
+  measure = msr("classif.acc"),  
+  term_evals = 20
+)  
+   
+instance$result  
+   
+as.data.table(instance$archive)  
+   
+learner$param_set$values = instance$result_learner_param_vals  
+learner$train(iscanceled_task)  
+```
+
+## Getting the optimal combination of parameters
+
+```{r}
+best_params <- instance$result$learner_param_vals
+best_params
+```
+
+## Fit the model using the optimal parameters and evaluate
+
+```{r}
+lrn_ranger_best <- lrn("classif.ranger", predict_type = "prob", mtry = 4, min.node.size = 1, num.trees = 1102, id = "best")
+
+pl_ranger_best <- pl_missing %>>% po(lrn_ranger_best)
+
+set.seed(212)
+
+res_2 <- benchmark(data.table(
+  task       = list(iscanceled_task),
+  learner    = list(lrn_baseline,
+                    lrn_cart,
+                    pl_ranger,
+                    pl_ranger_best
+                    ),
+  resampling = list(cv5)
+), store_models = TRUE)
+
+result_2 <- res_2$aggregate(list(
+                   msr("classif.acc"), # Accuracy
+                   msr("classif.auc"), # Area Under the ROC Curve
+                   msr("classif.ce"),  # Classification Error
+                   msr("classif.fpr"), # False Positive Rate
+                   msr("classif.fnr"), # False Negative Rate
+                   msr("classif.precision"), # Precision
+                   msr("classif.mcc"), # Matthews Correlation Coefficient
+                   msr("classif.recall"))) # Recall
+
+view(result_2)
+```
+
+
+
+
